@@ -1,10 +1,14 @@
 """Playwright-based scraper for guangdada.net ad-creative rankings.
 
-The scraper automates login, navigates to the weekly top-creatives
-page, and extracts metadata + image URLs for the TOP-N items.
+Navigates to the weekly hot-charts page inside the SPA at::
+
+    https://guangdada.net/modules/creative/charts/hot-charts
+
+and extracts metadata + image URLs for the TOP-N items.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import random
@@ -25,8 +29,17 @@ from src.config import ScraperConfig
 
 logger = logging.getLogger(__name__)
 
-_BASE_URL = "https://www.guangdada.net"
-_LOGIN_URL = f"{_BASE_URL}/user/login"
+_BASE_URL = "https://guangdada.net"
+_LOGIN_URL = f"{_BASE_URL}/modules/auth/login"
+
+# Actual SPA routes discovered from the live site
+_CHART_URLS = {
+    "weekly": f"{_BASE_URL}/modules/creative/charts/hot-charts",
+    "daily": f"{_BASE_URL}/modules/creative/charts/hot-charts",
+    "surge": f"{_BASE_URL}/modules/creative/charts/surge-charts",
+    "new": f"{_BASE_URL}/modules/creative/charts/new-charts",
+    "monthly": f"{_BASE_URL}/modules/creative/charts/hot-charts",
+}
 
 _STATE_DIR_NAME = "guangdada_state"
 
@@ -34,31 +47,30 @@ _USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
 ]
 
-# CSS selectors — centralised so page-structure changes are easy to fix.
-# These are best-effort defaults; guangdada.net is a SPA and the DOM
-# may change across releases.
+# Selectors matched against the real DOM (Ant Design + TailwindCSS SPA)
 SELECTORS = {
-    "login_username": 'input[type="text"][placeholder*="邮箱"], input[name="username"], input[name="email"], #username, #email',
-    "login_password": 'input[type="password"], input[name="password"], #password',
-    "login_submit": 'button[type="submit"], button:has-text("登录"), .login-btn',
-    "login_success_indicator": '.user-avatar, .user-info, .header-user, [class*="avatar"], [class*="user-name"]',
-    "ranking_nav": 'a[href*="rank"], a:has-text("排行"), [class*="rank"]',
-    "creative_card": '[class*="creative-card"], [class*="material-item"], [class*="rank-item"], .card-item',
-    "creative_image": "img[src]",
-    "creative_title": '[class*="title"], [class*="name"], h3, h4',
-    "creative_days": '[class*="day"], [class*="duration"]',
-    "creative_channel": '[class*="channel"], [class*="platform"], [class*="media"]',
-    "period_weekly": 'button:has-text("周"), [class*="week"], a:has-text("本周")',
+    "login_username": 'input[type="text"][placeholder*="邮箱"], input[type="text"][placeholder*="email"], input[type="email"], input[name="username"], input[name="email"]',
+    "login_password": 'input[type="password"]',
+    "login_submit": 'button[type="submit"], button:has-text("登录"), button:has-text("Login")',
+    "login_success_indicator": '[class*="avatar"], [class*="userInfo"], [class*="user-name"]',
+    # Each ranking row is a 150px-tall card with rounded border
+    "chart_card": 'div.rounded-lg.border',
+    # Thumbnail image inside LazyLoad container
+    "card_image": 'img.object-cover[src*="zingfront.com"], img.object-cover[src*="cdn"], img.object-cover[loading="lazy"]',
+    # Title text
+    "card_title": '.text-base.font-medium, .text-sm.font-medium',
+    # Channel / platform tags
+    "card_tag": '.ant-tag',
+    # Duration / days info
+    "card_duration": '.text-xs.text-\\[\\#666\\], .text-xs.text-\\[\\#999\\]',
 }
 
 
 @dataclass
 class CreativeItem:
     """A single ad-creative entry from the ranking page."""
-
     rank: int = 0
     title: str = ""
     image_url: str = ""
@@ -80,20 +92,40 @@ def _random_delay(lo: float = 0.5, hi: float = 2.0) -> None:
 
 
 def _pick_ua(config_ua: str) -> str:
-    if config_ua:
-        return config_ua
-    return random.choice(_USER_AGENTS)
+    return config_ua if config_ua else random.choice(_USER_AGENTS)
 
 
 class GuangdadaScraper:
-    """High-level façade around Playwright for guangdada.net."""
+    """High-level facade around Playwright for guangdada.net."""
 
-    def __init__(self, config: ScraperConfig) -> None:
+    def __init__(self, config: ScraperConfig, debug_dir: Optional[Path] = None) -> None:
         self._cfg = config
         self._pw: Optional[Playwright] = None
         self._browser: Optional[Browser] = None
         self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
+        self._debug_dir = debug_dir
+        self._debug_step = 0
+
+    # ------------------------------------------------------------------
+    # Debug
+    # ------------------------------------------------------------------
+
+    def _debug_snapshot(self, label: str) -> None:
+        if not self._debug_dir or not self._page:
+            return
+        self._debug_dir.mkdir(parents=True, exist_ok=True)
+        self._debug_step += 1
+        prefix = f"{self._debug_step:02d}_{label}"
+        try:
+            self._page.screenshot(path=str(self._debug_dir / f"{prefix}.png"), full_page=True)
+        except Exception:
+            pass
+        try:
+            (self._debug_dir / f"{prefix}.html").write_text(self._page.content(), encoding="utf-8")
+        except Exception:
+            pass
+        logger.info("[debug] %s  url=%s", prefix, self._page.url)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -104,21 +136,18 @@ class GuangdadaScraper:
         ua = _pick_ua(self._cfg.user_agent)
         state_path = _state_dir()
 
-        launch_kwargs: dict = {
-            "headless": self._cfg.headless,
-        }
-        self._browser = self._pw.chromium.launch(**launch_kwargs)
+        self._browser = self._pw.chromium.launch(headless=self._cfg.headless)
 
-        context_kwargs: dict = {
+        ctx_kwargs: dict = {
             "user_agent": ua,
             "viewport": {"width": 1920, "height": 1080},
             "locale": "zh-CN",
         }
-        if self._cfg.cookie_reuse and state_path.exists() and (state_path / "state.json").exists():
-            context_kwargs["storage_state"] = str(state_path / "state.json")
-            logger.info("复用已保存的浏览器状态")
+        if self._cfg.cookie_reuse and (state_path / "state.json").is_file():
+            ctx_kwargs["storage_state"] = str(state_path / "state.json")
+            logger.info("Reusing saved browser state")
 
-        self._context = self._browser.new_context(**context_kwargs)
+        self._context = self._browser.new_context(**ctx_kwargs)
         self._context.set_default_timeout(self._cfg.timeout_ms)
         self._page = self._context.new_page()
 
@@ -137,75 +166,66 @@ class GuangdadaScraper:
         state_path = _state_dir()
         state_path.mkdir(parents=True, exist_ok=True)
         self._context.storage_state(path=str(state_path / "state.json"))
-        logger.info("浏览器状态已保存至 %s", state_path)
 
     # ------------------------------------------------------------------
     # Login
     # ------------------------------------------------------------------
 
     def login(self, username: str, password: str) -> bool:
-        """Log in to guangdada.net.  Returns ``True`` on success."""
         assert self._page is not None
         page = self._page
 
-        logger.info("导航到登录页 %s", _LOGIN_URL)
         page.goto(_LOGIN_URL, wait_until="networkidle")
         _random_delay(1, 2)
+        self._debug_snapshot("login_page")
 
-        if self._is_logged_in(page):
-            logger.info("已处于登录状态（Cookie 复用成功）")
+        # Already logged in?  Check by visiting dashboard
+        if "login" not in page.url.lower() and "auth" not in page.url.lower():
+            logger.info("Already logged in")
             return True
 
-        logger.info("填写登录表单…")
-        username_input = page.locator(SELECTORS["login_username"]).first
-        username_input.click()
-        username_input.fill(username)
+        try:
+            page.locator(SELECTORS["login_success_indicator"]).first.is_visible(timeout=2000)
+            logger.info("Already logged in (avatar visible)")
+            return True
+        except Exception:
+            pass
+
+        logger.info("Filling login form...")
+        page.locator(SELECTORS["login_username"]).first.click()
+        page.locator(SELECTORS["login_username"]).first.fill(username)
         _random_delay(0.3, 0.8)
 
-        password_input = page.locator(SELECTORS["login_password"]).first
-        password_input.click()
-        password_input.fill(password)
+        page.locator(SELECTORS["login_password"]).first.click()
+        page.locator(SELECTORS["login_password"]).first.fill(password)
         _random_delay(0.3, 0.6)
 
         page.locator(SELECTORS["login_submit"]).first.click()
-        logger.info("提交登录…")
+        logger.info("Submitting...")
 
+        # Wait for URL to change away from login/auth
         try:
-            page.wait_for_selector(
-                SELECTORS["login_success_indicator"],
-                timeout=15000,
-            )
+            page.wait_for_url("**/modules/**", timeout=15000)
         except Exception:
-            logger.warning("登录后未检测到成功标识——可能需要验证码。")
-            if self._cfg.headless:
-                logger.error(
-                    "当前为 headless 模式，无法处理验证码。"
-                    "请使用 --no-headless 重试。"
-                )
-                return False
-            logger.info("等待用户手动完成验证码（60 秒超时）…")
-            try:
-                page.wait_for_selector(
-                    SELECTORS["login_success_indicator"],
-                    timeout=60000,
-                )
-            except Exception:
-                logger.error("登录超时。")
+            self._debug_snapshot("login_timeout")
+            if not self._cfg.headless:
+                logger.info("Waiting for manual captcha (60s)...")
+                try:
+                    page.wait_for_url("**/modules/**", timeout=60000)
+                except Exception:
+                    logger.error("Login timeout")
+                    return False
+            else:
+                logger.error("Login failed (headless). Use --no-headless for captcha.")
                 return False
 
-        logger.info("登录成功！")
+        logger.info("Login success!")
+        self._debug_snapshot("login_success")
         self._save_state()
         return True
 
-    @staticmethod
-    def _is_logged_in(page: Page) -> bool:
-        try:
-            return page.locator(SELECTORS["login_success_indicator"]).first.is_visible(timeout=3000)
-        except Exception:
-            return False
-
     # ------------------------------------------------------------------
-    # Scrape ranking
+    # Scrape charts
     # ------------------------------------------------------------------
 
     def scrape_top_creatives(
@@ -213,133 +233,157 @@ class GuangdadaScraper:
         top_n: int = 20,
         period: str = "weekly",
     ) -> list[CreativeItem]:
-        """Navigate to the ranking page and extract TOP-N creative items."""
         assert self._page is not None
         page = self._page
-        items: list[CreativeItem] = []
 
-        logger.info("导航到买量素材排行榜…")
-        self._navigate_to_ranking(page)
-        _random_delay(1, 2)
+        chart_url = _CHART_URLS.get(period, _CHART_URLS["weekly"])
+        logger.info("Navigating to %s", chart_url)
+        page.goto(chart_url, wait_until="networkidle")
+        _random_delay(2, 3)
+        self._debug_snapshot("chart_page")
 
-        if period == "weekly":
-            self._select_period_weekly(page)
-            _random_delay(1, 2)
+        # Scroll to load all items
+        self._scroll_to_load(page, rounds=8)
+        self._debug_snapshot("after_scroll")
 
-        logger.info("等待素材卡片加载…")
-        try:
-            page.wait_for_selector(SELECTORS["creative_card"], timeout=self._cfg.timeout_ms)
-        except Exception:
-            logger.warning("未找到素材卡片选择器，尝试回退方案…")
-            self._fallback_extract(page, items, top_n)
-            return items[:top_n]
+        # Extract items via JavaScript for reliability
+        items = self._extract_items_js(page, top_n)
 
-        self._scroll_to_load(page, target_count=top_n)
-
-        cards = page.locator(SELECTORS["creative_card"]).all()
-        logger.info("找到 %d 个素材卡片", len(cards))
-
-        for idx, card in enumerate(cards[:top_n], start=1):
-            item = self._parse_card(card, idx)
-            if item.image_url:
-                items.append(item)
-                logger.debug("  #%d %s", item.rank, item.title or "(无标题)")
+        if not items:
+            logger.warning("JS extraction returned 0 items, trying DOM selectors...")
+            items = self._extract_items_dom(page, top_n)
 
         self._save_state()
-        logger.info("共提取 %d 个素材", len(items))
+        logger.info("Extracted %d items", len(items))
         return items
 
-    def _navigate_to_ranking(self, page: Page) -> None:
-        ranking_link = page.locator(SELECTORS["ranking_nav"]).first
-        try:
-            if ranking_link.is_visible(timeout=5000):
-                ranking_link.click()
-                page.wait_for_load_state("networkidle")
-                return
-        except Exception:
-            pass
+    def _scroll_to_load(self, page: Page, rounds: int = 8) -> None:
+        for _ in range(rounds):
+            page.evaluate("window.scrollBy(0, 600)")
+            _random_delay(0.3, 0.8)
 
-        ranking_urls = [
-            f"{_BASE_URL}/ad-creatives/ranking",
-            f"{_BASE_URL}/rank",
-            f"{_BASE_URL}/creative/rank",
-            f"{_BASE_URL}/app-ranking",
-        ]
-        for url in ranking_urls:
-            logger.info("尝试直接访问 %s", url)
-            page.goto(url, wait_until="networkidle")
-            if page.url != _LOGIN_URL and "login" not in page.url:
-                return
-        logger.warning("无法找到排行榜页面，使用当前页面继续")
+    def _extract_items_js(self, page: Page, top_n: int) -> list[CreativeItem]:
+        """Use JavaScript to extract items directly from the DOM."""
+        try:
+            raw = page.evaluate("""(topN) => {
+                // Each chart card is a rounded-lg border div with h-[150px]
+                const cards = document.querySelectorAll('div.rounded-lg.border');
+                const results = [];
+                let rank = 0;
+                for (const card of cards) {
+                    if (rank >= topN) break;
+                    // Must contain an image to be a real card
+                    const imgs = card.querySelectorAll('img[src*="zingfront"], img[src*="cdn"], img.object-cover');
+                    if (imgs.length === 0) continue;
+                    rank++;
+                    // Pick the first substantial image (not app icon)
+                    let imgSrc = '';
+                    for (const img of imgs) {
+                        const src = img.src || '';
+                        if (src.includes('sp2cdn') || src.includes('sp_opera') || (img.classList.contains('object-cover') && src.length > 40)) {
+                            imgSrc = src;
+                            break;
+                        }
+                    }
+                    if (!imgSrc && imgs[0]) imgSrc = imgs[0].src || '';
 
-    def _select_period_weekly(self, page: Page) -> None:
-        try:
-            btn = page.locator(SELECTORS["period_weekly"]).first
-            if btn.is_visible(timeout=3000):
-                btn.click()
-                page.wait_for_load_state("networkidle")
-                logger.info("已选择「本周」时间范围")
-        except Exception:
-            logger.warning("未找到周期选择器，使用默认时间范围")
+                    // Title: look for font-medium text
+                    let title = '';
+                    const titleEls = card.querySelectorAll('.font-medium');
+                    for (const t of titleEls) {
+                        const txt = t.textContent.trim();
+                        if (txt.length > 2 && txt.length < 100) { title = txt; break; }
+                    }
 
-    def _scroll_to_load(self, page: Page, target_count: int) -> None:
-        """Incrementally scroll down to trigger lazy-loaded cards."""
-        for _ in range(10):
-            count = page.locator(SELECTORS["creative_card"]).count()
-            if count >= target_count:
-                break
-            page.evaluate("window.scrollBy(0, 800)")
-            _random_delay(0.5, 1.5)
+                    // Tags (channel info)
+                    const tags = [];
+                    card.querySelectorAll('.ant-tag').forEach(t => {
+                        const txt = t.textContent.trim();
+                        if (txt) tags.push(txt);
+                    });
 
-    def _parse_card(self, card, rank: int) -> CreativeItem:
-        item = CreativeItem(rank=rank)
-        try:
-            img = card.locator(SELECTORS["creative_image"]).first
-            item.image_url = img.get_attribute("src") or ""
-            if item.image_url.startswith("//"):
-                item.image_url = "https:" + item.image_url
-        except Exception:
-            pass
-        try:
-            item.title = (card.locator(SELECTORS["creative_title"]).first.inner_text() or "").strip()
-        except Exception:
-            pass
-        try:
-            item.days = (card.locator(SELECTORS["creative_days"]).first.inner_text() or "").strip()
-        except Exception:
-            pass
-        try:
-            item.channel = (card.locator(SELECTORS["creative_channel"]).first.inner_text() or "").strip()
-        except Exception:
-            pass
-        try:
-            link = card.locator("a[href]").first
-            href = link.get_attribute("href") or ""
-            if href and not href.startswith("javascript"):
-                item.detail_url = href if href.startswith("http") else _BASE_URL + href
-        except Exception:
-            pass
-        return item
+                    // Duration / stats text
+                    let stats = '';
+                    card.querySelectorAll('.text-xs').forEach(el => {
+                        const txt = el.textContent.trim();
+                        if (txt.includes('天') || txt.includes('day')) stats = txt;
+                    });
 
-    def _fallback_extract(self, page: Page, items: list[CreativeItem], top_n: int) -> None:
-        """Fallback: extract all visible images on the page as creative items."""
-        logger.info("使用回退方案：提取页面所有可见图片…")
-        images = page.locator("img[src]").all()
-        rank = 1
-        for img in images:
-            if rank > top_n:
-                break
-            src = img.get_attribute("src") or ""
-            if not src or "logo" in src.lower() or "icon" in src.lower() or len(src) < 20:
-                continue
+                    // Detail link
+                    let detailUrl = '';
+                    const link = card.querySelector('a[href]');
+                    if (link) detailUrl = link.href || '';
+
+                    results.push({
+                        rank: rank,
+                        title: title,
+                        imgSrc: imgSrc,
+                        tags: tags.join(', '),
+                        stats: stats,
+                        detailUrl: detailUrl,
+                    });
+                }
+                return results;
+            }""", top_n)
+        except Exception as e:
+            logger.warning("JS extraction error: %s", e)
+            return []
+
+        items: list[CreativeItem] = []
+        for r in raw:
+            src = r.get("imgSrc", "")
             if src.startswith("//"):
                 src = "https:" + src
-            if src.startswith("data:"):
+            items.append(CreativeItem(
+                rank=r.get("rank", 0),
+                title=r.get("title", ""),
+                image_url=src,
+                days=r.get("stats", ""),
+                channel=r.get("tags", ""),
+                detail_url=r.get("detailUrl", ""),
+            ))
+        return items
+
+    def _extract_items_dom(self, page: Page, top_n: int) -> list[CreativeItem]:
+        """Fallback: use Playwright locators."""
+        cards = page.locator("div.rounded-lg.border").all()
+        logger.info("DOM fallback: found %d rounded-lg.border divs", len(cards))
+        items: list[CreativeItem] = []
+        rank = 0
+
+        for card in cards:
+            if rank >= top_n:
+                break
+            try:
+                img = card.locator("img.object-cover").first
+                src = img.get_attribute("src") or ""
+                if not src or len(src) < 30:
+                    continue
+            except Exception:
                 continue
+
+            rank += 1
+            if src.startswith("//"):
+                src = "https:" + src
+
             item = CreativeItem(rank=rank, image_url=src)
             try:
-                item.title = img.get_attribute("alt") or ""
+                item.title = card.locator(".font-medium").first.inner_text().strip()
+            except Exception:
+                pass
+            try:
+                tags = card.locator(".ant-tag").all_inner_texts()
+                item.channel = ", ".join(t.strip() for t in tags if t.strip())
+            except Exception:
+                pass
+            try:
+                texts = card.locator(".text-xs").all_inner_texts()
+                for t in texts:
+                    if "天" in t or "day" in t.lower():
+                        item.days = t.strip()
+                        break
             except Exception:
                 pass
             items.append(item)
-            rank += 1
+
+        return items

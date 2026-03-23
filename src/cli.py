@@ -99,7 +99,8 @@ def cmd_scrape(args: argparse.Namespace) -> int:
     if args.output_dir:
         cfg.output.base_dir = args.output_dir
 
-    scraper = GuangdadaScraper(cfg.scraper)
+    debug_dir = Path("debug") / time.strftime("%Y%m%d_%H%M%S") if getattr(args, "debug", False) else None
+    scraper = GuangdadaScraper(cfg.scraper, debug_dir=debug_dir)
     try:
         scraper.start()
 
@@ -267,6 +268,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_scrape.add_argument("--output-dir", default=None, help="自定义输出目录（绝对路径）")
     p_scrape.add_argument("--no-analyze", action="store_true", help="只下载不分析")
     p_scrape.add_argument("--no-headless", action="store_true", help="使用有头浏览器（用于调试/验证码）")
+    p_scrape.add_argument("--debug", action="store_true", help="保存每步截图和HTML到 debug/ 目录")
 
     # analyze
     p_analyze = sub.add_parser("analyze", help="对已下载的图片目录重新分析")
