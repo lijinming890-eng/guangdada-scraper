@@ -1,189 +1,196 @@
-# guangdada-scraper
+# 广大大买量素材爬虫 (Guangdada Scraper)
 
-广大大 (guangdada.net / SocialPeta) 手游买量素材爬虫，封装为 [OpenClaw](https://github.com/nicepkg/openclaw) Skill。
-
-自动登录广大大 → 应用买量筛选预设 → 多页爬取素材 → 按展示估值排序 → 下载图片/视频 → AI 创意分析 → 生成报告并导入飞书文档。
+> 🎯 手游买量广告素材爬取工具 — 自动登录广大大，智能筛选买量素材，一键生成飞书文档报告。
 
 ## 功能特性
 
-- **智能爬取**：自动应用买量筛选预设，爬取最多 15 页数据，按展示估值全局排序取 Top N
-- **图片/视频支持**：图片直接下载，视频提取 .mp4 播放链接并上传飞书云盘
-- **AI 创意分析**：使用 Kimi k2p5 视觉模型，8 维度专业分析（素材类型、视觉风格、核心卖点、文字信息、目标受众、创意亮点、优化建议、综合评分）
-- **飞书集成**：自动创建飞书云文档，视频在文档内可直接点击播放
-- **凭据加密**：Fernet (AES-128-CBC + HMAC-SHA256) 加密存储账号密码
-- **Cookie 复用**：首次登录后保存浏览器状态，后续免重复登录
-- **反爬策略**：随机延时、UA 伪装、模拟滚动、验证码 headful 降级
+- **智能买量筛选**：自动应用"买量筛选/买量视频"预设，精准过滤游戏广告素材
+- **全局数据排序**：爬取最多 15 页数据，按展示估值从高到低排序，取最优 Top N
+- **视频原生播放**：自动提取 .mp4 链接，上传飞书云盘，文档内可直接播放
+- **AI 创意分析**：Kimi k2p5 视觉模型 8 维度专业分析（素材类型、视觉风格、核心卖点、综合评分等）
+- **飞书文档输出**：一键生成结构化飞书云文档，完成后自动返回链接
+- **凭据加密存储**：Fernet (AES-128-CBC) 加密，密钥与密文分离
+
+## 技术栈
+
+| 技术 | 用途 |
+|------|------|
+| Python 3.10+ | 主语言 |
+| Playwright | 浏览器自动化爬取 |
+| Kimi k2p5 | AI 视觉创意分析 |
+| 飞书 Docx API | 文档创建与发布 |
+| 飞书 Drive API | 视频上传云盘 |
+| Fernet | 凭据加密存储 |
+| Click + Rich | CLI 交互与美化输出 |
 
 ## 快速开始
 
-### 1. 安装依赖
+### 前置要求
+
+- [OpenClaw](https://github.com/nicepkg/openclaw) 已安装并运行
+- Python 3.10+
+- 广大大账号（guangdada.net）
+- Kimi API Key（AI 分析功能可选）
+
+### 安装步骤
+
+**1. 克隆仓库到 OpenClaw skills 目录**
+
+```bash
+cd ~/.openclaw/workspace/skills
+git clone https://github.com/lijinming890-eng/guangdada-scraper.git
+cd guangdada-scraper
+```
+
+**2. 安装依赖**
 
 ```bash
 pip install -r requirements.txt
 playwright install chromium
 ```
 
-### 2. 存储登录凭据
+**3. 存储广大大登录凭据**
 
 ```bash
-python -m src.cli login --username your_email@example.com --password your_password
+python -m src.cli login --username 你的邮箱 --password 你的密码
 ```
 
-### 3. 运行爬虫
+**4. 配置 Kimi API Key（可选，AI 分析需要）**
 
-```bash
-# 图片素材 Top 10，导出飞书文档
-python -m src.cli scrape --media-type "图片" --top 10 --export-feishu
+编辑 `~/.openclaw/agents/main/agent/auth-profiles.json`：
 
-# 视频素材 Top 10，导出飞书文档
-python -m src.cli scrape --media-type "视频" --top 10 --export-feishu
-
-# 图片素材 + AI 创意分析
-python -m src.cli scrape --media-type "图片" --top 10 --analyze --export-feishu
-
-# 视频素材 + AI 创意分析
-python -m src.cli scrape --media-type "视频" --top 10 --analyze --export-feishu
+```json
+{
+  "profiles": {
+    "kimi-coding:default": {
+      "key": "你的 Kimi API Key"
+    }
+  }
+}
 ```
 
-### 4. 环境诊断
+**5. 验证安装**
 
 ```bash
 python -m src.cli doctor
+python -m src.cli check-auth
 ```
 
-## 自动筛选规则
+### 飞书配置
 
-| 媒体类型 | 自动选择预设 |
-|---------|------------|
-| 图片 | "买量筛选" |
-| 视频 | "买量视频" |
+确认 `~/.openclaw/openclaw.json` 中飞书已启用：
 
-- 抓取全部页面后按**展示估值**从高到低排序，取前 N 条
-- 不是简单取前 N 条，而是从所有数据中筛选最优
+```json
+{
+  "channels": {
+    "feishu": {
+      "enabled": true,
+      "appId": "你的飞书 App ID",
+      "appSecret": "你的飞书 App Secret"
+    }
+  }
+}
+```
 
-## 作为 OpenClaw Skill 使用
+飞书应用需要的权限：`docx:document`、`drive:drive`
 
-已内置为 OpenClaw 技能。在飞书中对 AI 说以下任意关键词即可触发：
+## 使用说明
 
-- "帮我爬取广大大买量素材"
-- "抓取本周图片素材 Top 10"
-- "分析视频买量素材"
-- "创意分析素材"
+### 通过飞书对话（推荐）
 
-AI 会自动调用 exec 工具执行对应命令。
+在飞书中对 OpenClaw 机器人发消息即可触发：
 
-## CLI 命令参考
+| 你说 | 效果 |
+|------|------|
+| "帮我爬取广大大买量素材" | 图片 Top 10 → 飞书文档 |
+| "抓取视频素材 Top 10" | 视频 Top 10 → 飞书文档 |
+| "分析图片素材" | 图片 Top 10 + AI 分析 → 飞书文档 |
+| "爬取视频素材并分析" | 视频 Top 10 + AI 分析 → 飞书文档 |
 
-### 凭据管理
+完成后 AI 自动返回飞书文档链接。
+
+### 命令行执行
 
 ```bash
-python -m src.cli login --username xxx --password yyy   # 加密存储凭据
-python -m src.cli logout                                 # 清除凭据
-python -m src.cli check-auth                             # 验证凭据有效性
+# 图片素材 Top 10
+python -m src.cli scrape --media-type "图片" --top 10 --export-feishu
+
+# 视频素材 Top 10
+python -m src.cli scrape --media-type "视频" --top 10 --export-feishu
+
+# 图片 + AI 分析
+python -m src.cli scrape --media-type "图片" --top 10 --analyze --export-feishu
+
+# 仅本地报告（不导出飞书）
+python -m src.cli scrape --media-type "图片" --top 10
 ```
 
-### 爬取参数
+### 自动筛选规则
 
-| 参数 | 说明 | 默认值 |
-|------|------|-------|
-| `--media-type` | "图片" 或 "视频" | 全部 |
-| `--top` | 取排名前 N 条 | 10 |
-| `--analyze` | 启用 AI 视觉分析 | 关 |
-| `--export-feishu` | 导出到飞书文档 | 关 |
-| `--no-headless` | 有头模式（调试用） | 无头 |
-| `--no-download` | 不下载图片 | 下载 |
-| `--output-dir` | 输出目录 | output/guangdada |
-| `--saved-filter` | 筛选预设名 | 自动 |
-| `--period` | 时间维度 | weekly |
-| `--time-range` | 时间范围 | - |
+| 媒体类型 | 自动预设 | 排序方式 |
+|---------|---------|---------|
+| 图片 | "买量筛选" | 展示估值 ↓ |
+| 视频 | "买量视频" | 展示估值 ↓ |
 
-## 执行时间预估
+### 执行时间
 
-| 场景 | 预估时间 |
-|------|---------|
-| 图片素材 | 2-4 分钟 |
-| 视频素材 | 4-8 分钟 |
-| +AI 分析 | 额外 1-3 分钟 |
+| 场景 | 耗时 |
+|------|------|
+| 图片 Top 10 | 2-4 分钟 |
+| 视频 Top 10 | 4-8 分钟 |
+| + AI 分析 | 额外 1-3 分钟 |
 
 ## 项目结构
 
 ```
 guangdada-scraper/
-├── README.md                    # 本文件
-├── SKILL.md                     # OpenClaw Skill 定义
-├── DEVLOG.md                    # 开发日志
-├── requirements.txt             # Python 依赖
-├── config.yaml.template         # 配置模板
+├── SKILL.md                  # OpenClaw 技能定义
+├── DEVLOG.md                 # 开发日志
+├── README.md                 # 项目说明
+├── requirements.txt          # Python 依赖
+├── config.yaml.template      # 配置模板
 ├── src/
-│   ├── __init__.py
-│   ├── __main__.py              # python -m src 入口
-│   ├── cli.py                   # CLI 编排（登录/爬取/分析/发布）
-│   ├── config.py                # 配置加载器
-│   ├── credential_store.py      # Fernet 加密凭据管理
-│   ├── scraper.py               # Playwright 浏览器自动化爬虫
-│   ├── image_downloader.py      # 图片下载
-│   ├── analyzer.py              # Markdown 报告生成
-│   ├── ai_analyzer.py           # Kimi AI 视觉创意分析
-│   └── feishu_publisher.py      # 飞书文档发布 + 视频云盘上传
-├── test/                        # 单元测试
-├── examples/                    # 配置示例
-└── output/                      # 爬取结果输出
+│   ├── cli.py                # CLI 入口（编排全流程）
+│   ├── scraper.py            # Playwright 爬虫核心
+│   ├── ai_analyzer.py        # Kimi AI 视觉分析
+│   ├── analyzer.py           # Markdown 报告生成
+│   ├── feishu_publisher.py   # 飞书文档发布 + 视频上传
+│   ├── image_downloader.py   # 图片下载器
+│   ├── credential_store.py   # 凭据加密管理
+│   └── config.py             # 配置加载器
+├── output/                   # 爬取结果（自动生成）
+└── test/                     # 单元测试
 ```
 
-## 架构
+## 工作原理
 
-```
-┌─────────────────────────────────────────────────┐
-│                     CLI (cli.py)                 │
-│   login | scrape | analyze | publish | doctor    │
-└──────────────────┬──────────────────────────────┘
-                   │
-     ┌─────────────┼──────────────┐
-     ▼             ▼              ▼
-┌──────────┐ ┌──────────┐ ┌──────────────┐
-│Credential│ │ Scraper  │ │ AI Analyzer  │
-│  Store   │ │(Playwright)│ │  (Kimi k2p5) │
-└──────────┘ └────┬─────┘ └──────────────┘
-                  │
-     ┌────────────┼────────────┐
-     ▼            ▼            ▼
-┌──────────┐ ┌──────────┐ ┌──────────────┐
-│  Image   │ │ Markdown │ │    Feishu    │
-│Downloader│ │  Report  │ │  Publisher   │
-└──────────┘ └──────────┘ └──────────────┘
-```
-
-## 依赖
-
-| 包 | 用途 |
-|---|------|
-| playwright | 浏览器自动化 |
-| click | CLI 框架 |
-| rich | 终端美化输出 |
-| requests | 图片下载 / API 调用 |
-| cryptography | Fernet 加密凭据存储 |
-| Pillow | 图片分析 |
-| PyYAML | 配置文件解析 |
-
-Python 3.9+（推荐 3.10+）
+1. **登录**：使用加密凭据自动登录广大大，Cookie 复用免重复登录
+2. **筛选**：根据媒体类型自动应用"买量筛选"或"买量视频"预设
+3. **爬取**：Playwright 翻页爬取（最多 15 页），模拟滚动加载懒加载内容
+4. **排序**：全部数据按展示估值降序排列，取 Top N 条
+5. **下载**：下载素材图片到本地；视频额外提取 .mp4 播放链接
+6. **AI 分析（可选）**：将图片以 base64 发送给 Kimi k2p5 视觉模型，获取 8 维度创意分析
+7. **生成报告**：输出结构化 Markdown 报告
+8. **发布飞书**：视频先上传飞书云盘，再创建飞书云文档，返回链接
 
 ## 常见问题
 
-**Q: 报 "Browser not found"**
-A: 运行 `playwright install chromium`
+| 问题 | 解决方案 |
+|------|---------|
+| Browser not found | `playwright install chromium` |
+| 登录出现验证码 | 加 `--no-headless` 手动验证 |
+| AI 分析报错 | 检查 `auth-profiles.json` 中 Kimi API Key |
+| 视频无法播放 | 确认飞书应用有 `drive:drive` 权限 |
+| OpenClaw 不执行命令 | 重启 gateway，确认 SKILL.md 存在 |
 
-**Q: 登录时出现验证码**
-A: 使用 `--no-headless` 以有头模式运行，手动完成验证
+## 更新
 
-**Q: 爬取超时**
-A: 检查网络连接，或尝试减少 `--top` 数量
+```bash
+cd ~/.openclaw/workspace/skills/guangdada-scraper
+git pull origin master
+pip install -r requirements.txt
+```
 
-**Q: AI 分析报 API 错误**
-A: 检查 `auth-profiles.json` 中的 Kimi API key 是否有效
-
-**Q: 视频在飞书文档中无法播放**
-A: 视频会自动上传到飞书云盘并生成链接，点击链接即可播放
-
-## License
+## 许可证
 
 MIT
