@@ -10,9 +10,32 @@ output/
 __pycache__/
 *.pyc
 .pytest_cache/
+*.egg-info/
 
 # Config (may contain sensitive overrides)
 config.yaml
+
+# Debug screenshots
+debug_*.png
+chart_*.png
+homepage.png
+test_display-ads.png
+
+# Temporary test/debug scripts (not part of core)
+analyze_html.py
+extract_chart.py
+extract_list.py
+find_page.py
+get_full_items.py
+inspect_page.py
+save_creds.py
+test_browser.py
+test_chart_page.py
+test_full.py
+test_ranking.py
+test_ai.py
+test_video_upload.py
+_query_memory.py
 
 # OS
 .DS_Store

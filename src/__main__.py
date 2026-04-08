@@ -1,4 +1,5 @@
-"""Allow running as ``python -m src``."""
-from src.cli import main
+"""Allow running as: python -m src.cli"""
+from .cli import cli
 
-main()
+if __name__ == "__main__":
+    cli()

@@ -1,356 +1,572 @@
-"""Playwright-based scraper for guangdada.net ad-creative rankings.
+"""Playwright-based scraper for guangdada.net ad creatives."""
 
-Navigates to the weekly hot-charts page inside the SPA at::
-
-    https://guangdada.net/modules/creative/charts/hot-charts
-
-and extracts structured metadata + image URLs for the TOP-N items.
-"""
-from __future__ import annotations
-
-import logging
-import os
-import random
-import time
-from dataclasses import dataclass, field
+import asyncio
+import re
 from pathlib import Path
-from typing import Optional
+from datetime import datetime
+from urllib.parse import urlparse
 
-from playwright.sync_api import (
-    Browser,
-    BrowserContext,
-    Page,
-    Playwright,
-    sync_playwright,
-)
+import yaml
+from playwright.async_api import async_playwright, Page, Browser
 
-from src.config import ScraperConfig
+from . import credential_store
 
-logger = logging.getLogger(__name__)
-
-_BASE_URL = "https://guangdada.net"
-_LOGIN_URL = f"{_BASE_URL}/modules/auth/login"
-
-_CHART_URLS = {
-    "weekly": f"{_BASE_URL}/modules/creative/charts/hot-charts",
-    "daily": f"{_BASE_URL}/modules/creative/charts/hot-charts",
-    "surge": f"{_BASE_URL}/modules/creative/charts/surge-charts",
-    "new": f"{_BASE_URL}/modules/creative/charts/new-charts",
-    "monthly": f"{_BASE_URL}/modules/creative/charts/hot-charts",
+URLS = {
+    "login": "https://www.guangdada.net/user/login",
+    "display_ads": "https://guangdada.net/modules/creative/display-ads",
+    "hot_charts": "https://guangdada.net/modules/creative/charts/hot-charts",
+    "surge_charts": "https://guangdada.net/modules/creative/charts/surge-charts",
+    "new_charts": "https://guangdada.net/modules/creative/charts/new-charts",
 }
 
-_STATE_DIR_NAME = "guangdada_state"
 
-_USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-]
-
-SELECTORS = {
-    "login_username": 'input[type="text"][placeholder*="邮箱"], input[type="text"][placeholder*="email"], input[type="email"], input[name="username"]',
-    "login_password": 'input[type="password"]',
-    "login_submit": 'button[type="submit"], button:has-text("登录"), button:has-text("Login")',
-    "login_success_indicator": '[class*="avatar"], [class*="userInfo"]',
-}
-
-_STYLE_KEYWORDS = frozenset([
-    "现代", "复古", "简约", "写实", "卡通", "插画", "平面设计", "3D",
-    "真人", "真人口播", "口播", "情景剧", "玩法特色", "录屏",
-    "暗色", "亮色", "多彩", "彩虹色", "中国风", "日系", "欧美",
-])
-
-
-@dataclass
-class CreativeItem:
-    """A single ad-creative entry from the ranking page."""
-    rank: int = 0
-    advertiser: str = ""
-    publisher: str = ""
-    image_url: str = ""
-    app_icon_url: str = ""
-    popularity: str = ""
-    industry_tags: list = field(default_factory=list)
-    style_tags: list = field(default_factory=list)
-    color_tags: list = field(default_factory=list)
-    duration_days: int = 0
-    date_start: str = ""
-    date_end: str = ""
-    detail_url: str = ""
-
-    @property
-    def title(self) -> str:
-        return self.advertiser or self.popularity
-
-    @property
-    def days(self) -> str:
-        if self.duration_days:
-            return f"{self.duration_days}天 ({self.date_start}~{self.date_end})"
-        return ""
-
-    @property
-    def channel(self) -> str:
-        return ", ".join(self.industry_tags)
-
-
-def _state_dir() -> Path:
-    base = os.environ.get("GDD_CREDENTIAL_DIR")
-    if base:
-        return Path(base) / _STATE_DIR_NAME
-    return Path.home() / ".openclaw" / _STATE_DIR_NAME
-
-
-def _random_delay(lo: float = 0.5, hi: float = 2.0) -> None:
-    time.sleep(random.uniform(lo, hi))
+def _load_config() -> dict:
+    config_path = Path(__file__).parent.parent / "config.yaml"
+    if not config_path.exists():
+        config_path = Path(__file__).parent.parent / "config.yaml.template"
+    with open(config_path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
 
 
 class GuangdadaScraper:
-    def __init__(self, config: ScraperConfig, debug_dir: Optional[Path] = None) -> None:
-        self._cfg = config
-        self._pw: Optional[Playwright] = None
-        self._browser: Optional[Browser] = None
-        self._context: Optional[BrowserContext] = None
-        self._page: Optional[Page] = None
-        self._debug_dir = debug_dir
-        self._debug_step = 0
+    def __init__(self, headless: bool | None = None):
+        self.config = _load_config()
+        self.headless = headless if headless is not None else self.config["scraper"]["headless"]
+        self.browser: Browser | None = None
+        self.page: Page | None = None
+        self.results: list[dict] = []
 
-    def _debug_snapshot(self, label: str) -> None:
-        if not self._debug_dir or not self._page:
-            return
-        self._debug_dir.mkdir(parents=True, exist_ok=True)
-        self._debug_step += 1
-        prefix = f"{self._debug_step:02d}_{label}"
-        try:
-            self._page.screenshot(path=str(self._debug_dir / f"{prefix}.png"), full_page=True)
-        except Exception:
-            pass
-        try:
-            (self._debug_dir / f"{prefix}.html").write_text(self._page.content(), encoding="utf-8")
-        except Exception:
-            pass
-        logger.info("[debug] %s  url=%s", prefix, self._page.url)
+    async def __aenter__(self):
+        await self.start()
+        return self
 
-    # -- Lifecycle --
+    async def __aexit__(self, *args):
+        await self.close()
 
-    def start(self) -> None:
-        self._pw = sync_playwright().start()
-        ua = self._cfg.user_agent or random.choice(_USER_AGENTS)
-        state_path = _state_dir()
+    async def start(self):
+        self._pw = await async_playwright().start()
+        self.browser = await self._pw.chromium.launch(
+            headless=self.headless,
+            args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],
+        )
+        ctx = await self.browser.new_context(
+            user_agent=self.config["scraper"]["user_agent"],
+            viewport={"width": 1920, "height": 1080},
+        )
+        self.page = await ctx.new_page()
+        self.page.set_default_timeout(self.config["scraper"]["timeout"])
 
-        self._browser = self._pw.chromium.launch(headless=self._cfg.headless)
-        ctx_kwargs: dict = {
-            "user_agent": ua,
-            "viewport": {"width": 1920, "height": 1080},
-            "locale": "zh-CN",
-        }
-        if self._cfg.cookie_reuse and (state_path / "state.json").is_file():
-            ctx_kwargs["storage_state"] = str(state_path / "state.json")
-            logger.info("Reusing saved browser state")
+    async def close(self):
+        if self.browser:
+            await self.browser.close()
+        if self._pw:
+            await self._pw.stop()
 
-        self._context = self._browser.new_context(**ctx_kwargs)
-        self._context.set_default_timeout(self._cfg.timeout_ms)
-        self._page = self._context.new_page()
+    async def login(self) -> bool:
+        creds = credential_store.load_credentials()
+        if not creds:
+            raise RuntimeError("No credentials found. Run: python -m src.cli login")
 
-    def stop(self) -> None:
-        for obj in (self._context, self._browser, self._pw):
-            try:
-                if obj:
-                    obj.close() if hasattr(obj, "close") else obj.stop()
-            except Exception:
-                pass
-        self._page = self._context = self._browser = self._pw = None
+        page = self.page
+        await page.goto(URLS["login"], wait_until="networkidle")
+        await page.wait_for_timeout(2000)
 
-    def _save_state(self) -> None:
-        if not self._context:
-            return
-        p = _state_dir()
-        p.mkdir(parents=True, exist_ok=True)
-        self._context.storage_state(path=str(p / "state.json"))
+        email_input = page.locator(
+            'input[type="text"], input[name="email"], '
+            'input[placeholder*="邮箱"], input[placeholder*="email"], '
+            'input[placeholder*="Email"], input[placeholder*="账号"]'
+        ).first
+        pwd_input = page.locator('input[type="password"]').first
 
-    # -- Login --
+        await email_input.fill(creds["username"])
+        await pwd_input.fill(creds["password"])
 
-    def login(self, username: str, password: str) -> bool:
-        assert self._page is not None
-        page = self._page
+        submit = page.locator(
+            'button[type="submit"], button:has-text("登录"), button:has-text("Login")'
+        ).first
+        await submit.click()
 
-        page.goto(_LOGIN_URL, wait_until="networkidle")
-        _random_delay(1, 2)
-        self._debug_snapshot("login_page")
-
-        if "login" not in page.url.lower() and "auth" not in page.url.lower():
-            logger.info("Already logged in")
+        await page.wait_for_timeout(3000)
+        if "login" not in page.url.lower():
             return True
-        try:
-            page.locator(SELECTORS["login_success_indicator"]).first.is_visible(timeout=2000)
-            logger.info("Already logged in (avatar visible)")
-            return True
-        except Exception:
-            pass
 
-        logger.info("Filling login form...")
-        page.locator(SELECTORS["login_username"]).first.fill(username)
-        _random_delay(0.3, 0.8)
-        page.locator(SELECTORS["login_password"]).first.fill(password)
-        _random_delay(0.3, 0.6)
-        page.locator(SELECTORS["login_submit"]).first.click()
-
-        try:
-            page.wait_for_url("**/modules/**", timeout=15000)
-        except Exception:
-            self._debug_snapshot("login_timeout")
-            if not self._cfg.headless:
-                logger.info("Waiting for manual captcha (60s)...")
-                try:
-                    page.wait_for_url("**/modules/**", timeout=60000)
-                except Exception:
-                    return False
-            else:
-                logger.error("Login failed (headless). Use --no-headless for captcha.")
-                return False
-
-        logger.info("Login success!")
-        self._debug_snapshot("login_success")
-        self._save_state()
+        await page.wait_for_url(re.compile(r"(?!.*login)"), timeout=10000)
         return True
 
-    # -- Scrape --
+    # ------------------------------------------------------------------
+    # Main entry: scrape display-ads with optional filters
+    # ------------------------------------------------------------------
 
-    def scrape_top_creatives(self, top_n: int = 20, period: str = "weekly") -> list[CreativeItem]:
-        assert self._page is not None
-        page = self._page
+    async def scrape_top_creatives(self, top: int = 0, period: str = "weekly",
+                                    filter_tag: str | None = None,
+                                    time_range: str | None = None,
+                                    media_type: str | None = None,
+                                    saved_filter: str | None = None,
+                                    on_progress=None) -> list[dict]:
+        page = self.page
 
-        chart_url = _CHART_URLS.get(period, _CHART_URLS["weekly"])
-        logger.info("Navigating to %s", chart_url)
-        page.goto(chart_url, wait_until="networkidle")
-        _random_delay(2, 3)
-        self._debug_snapshot("chart_page")
+        if on_progress:
+            on_progress("正在导航到展示广告页面...")
+        await page.goto(URLS["display_ads"], wait_until="networkidle")
+        await page.wait_for_timeout(3000)
 
-        for _ in range(10):
-            page.evaluate("window.scrollBy(0, 600)")
-            _random_delay(0.3, 0.8)
-        self._debug_snapshot("after_scroll")
+        if on_progress:
+            on_progress("正在应用筛选条件...")
+        await self._apply_filters(
+            page,
+            filter_tag=filter_tag,
+            time_range=time_range,
+            media_type=media_type,
+            saved_filter=saved_filter,
+        )
 
-        items = self._extract_items_js(page, top_n)
-        self._save_state()
-        logger.info("Extracted %d items", len(items))
+        if on_progress:
+            on_progress("正在抓取素材数据...")
+        items = await self._extract_with_pagination(page, 0, on_progress=on_progress)
+
+        items = self._sort_by_impressions(items)
+
+        if top > 0:
+            items = items[:top]
+
+        for i, item in enumerate(items, 1):
+            item["rank"] = i
+
+        if media_type == "视频" and items:
+            if on_progress:
+                on_progress(f"正在提取 {len(items)} 条视频的播放地址...")
+            items = await self._enrich_video_urls(page, items, saved_filter=saved_filter)
+            enriched = sum(1 for it in items if it.get("video_url"))
+            if on_progress:
+                on_progress(f"视频提取完成: {enriched}/{len(items)} 条获得播放地址")
+
+        self.results = items
         return items
 
-    def _extract_items_js(self, page: Page, top_n: int) -> list[CreativeItem]:
+    @staticmethod
+    def _parse_numeric(raw: str) -> float:
+        """Parse strings like '1538', '42万', '1.2亿', '12K', '8.8K', '2.3M'."""
+        raw = (raw or "").replace(",", "").replace(" ", "").strip()
+        if not raw or raw in ("-", "--"):
+            return 0
+        suffixes = {"亿": 1e8, "万": 1e4, "M": 1e6, "K": 1e3, "k": 1e3, "m": 1e6}
+        for suffix, mult in suffixes.items():
+            if raw.endswith(suffix):
+                try:
+                    return float(raw[:-len(suffix)]) * mult
+                except ValueError:
+                    return 0
         try:
-            raw = page.evaluate(_JS_EXTRACT, top_n)
-        except Exception as e:
-            logger.warning("JS extraction error: %s", e)
-            return []
+            return float(raw)
+        except ValueError:
+            return 0
 
-        items: list[CreativeItem] = []
-        for r in raw:
-            src = r.get("creativeSrc", "")
-            if src.startswith("//"):
-                src = "https:" + src
+    @classmethod
+    def _sort_by_impressions(cls, items: list[dict]) -> list[dict]:
+        """Sort items by impressions (展示估值) descending, fallback to popularity."""
+        def _key(item):
+            imp = cls._parse_numeric(item.get("impressions", ""))
+            if imp > 0:
+                return imp
+            return cls._parse_numeric(item.get("popularity", ""))
+        return sorted(items, key=_key, reverse=True)
 
-            # Classify tags
-            industry = []
-            style = []
-            colors = []
-            for tag in r.get("allTags", []):
-                if any(c in tag for c in "色") and len(tag) <= 4:
-                    colors.append(tag)
-                elif tag in _STYLE_KEYWORDS or any(kw in tag for kw in ["设计", "口播", "真人", "情景", "录屏", "插画", "卡通", "3D"]):
-                    style.append(tag)
-                else:
-                    industry.append(tag)
+    # ------------------------------------------------------------------
+    # Filters: media type, filter tag, time range, saved filter preset
+    # ------------------------------------------------------------------
 
-            items.append(CreativeItem(
-                rank=r.get("rank", 0),
-                advertiser=r.get("advertiser", ""),
-                publisher=r.get("publisher", ""),
-                image_url=src,
-                app_icon_url=r.get("appIconSrc", ""),
-                popularity=r.get("popularity", ""),
-                industry_tags=industry,
-                style_tags=style,
-                color_tags=colors,
-                duration_days=r.get("durationDays", 0),
-                date_start=r.get("dateStart", ""),
-                date_end=r.get("dateEnd", ""),
-            ))
+    async def _apply_filters(self, page: Page,
+                              filter_tag: str | None = None,
+                              time_range: str | None = None,
+                              media_type: str | None = None,
+                              saved_filter: str | None = None):
+        if media_type:
+            try:
+                type_btn = page.locator(
+                    f'label.ant-radio-button-wrapper:has-text("{media_type}")'
+                ).first
+                is_checked = await type_btn.evaluate(
+                    "el => el.classList.contains('ant-radio-button-wrapper-checked')"
+                )
+                if not is_checked:
+                    await type_btn.click(timeout=5000)
+                    await page.wait_for_timeout(3000)
+                    await page.wait_for_load_state("networkidle")
+            except Exception:
+                pass
+
+        if saved_filter:
+            try:
+                trigger = page.locator('.ant-dropdown-trigger:has-text("常用筛选")').first
+                await trigger.click(timeout=5000)
+                await page.wait_for_timeout(1500)
+
+                menu_item = page.locator(
+                    f'.ant-dropdown-menu-item:has-text("{saved_filter}")'
+                ).first
+                await menu_item.click(timeout=5000)
+                await page.wait_for_timeout(5000)
+                await page.wait_for_load_state("networkidle")
+            except Exception:
+                pass
+
+        if filter_tag:
+            tag_btn = page.locator(
+                f'.ant-btn:has-text("{filter_tag}"), '
+                f'span:has-text("{filter_tag}"), '
+                f'a:has-text("{filter_tag}"), '
+                f'div:has-text("{filter_tag}")'
+            ).first
+            try:
+                await tag_btn.click(timeout=5000)
+                await page.wait_for_timeout(3000)
+                await page.wait_for_load_state("networkidle")
+            except Exception:
+                pass
+
+        if time_range:
+            radio = page.locator(
+                f'label.ant-radio-button-wrapper:has-text("{time_range}")'
+            ).first
+            try:
+                is_checked = await radio.evaluate(
+                    "el => el.classList.contains('ant-radio-button-wrapper-checked')"
+                )
+                if not is_checked:
+                    await radio.click(timeout=5000)
+                    await page.wait_for_timeout(3000)
+                    await page.wait_for_load_state("networkidle")
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # Pagination: click next page until we have enough items
+    # ------------------------------------------------------------------
+
+    async def _scroll_to_load_all(self, page: Page):
+        """Scroll down the page to trigger lazy-loading of images."""
+        prev_height = 0
+        for _ in range(20):
+            cur_height = await page.evaluate("() => document.body.scrollHeight")
+            if cur_height == prev_height:
+                break
+            await page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(800)
+            prev_height = cur_height
+        await page.evaluate("() => window.scrollTo(0, 0)")
+        await page.wait_for_timeout(500)
+
+    async def _extract_with_pagination(self, page: Page, top: int,
+                                        on_progress=None) -> list[dict]:
+        """Extract cards across multiple pages.
+
+        Args:
+            top: Max items to collect. 0 means scrape up to ~15 pages for sorting.
+        """
+        items: list[dict] = []
+        seen_keys: set[str] = set()
+        unlimited = top == 0
+        max_pages = 15 if unlimited else (top // 3) + 5
+        extract_limit = 500 if unlimited else top * 2
+
+        for page_num in range(max_pages):
+            if on_progress:
+                on_progress(f"  第 {page_num + 1}/{max_pages} 页, 已收集 {len(items)} 条...")
+            await self._scroll_to_load_all(page)
+
+            batch = await self._extract_display_ads(page, extract_limit)
+            new_in_batch = 0
+            for item in batch:
+                key = f"{item.get('title', '')}|{item.get('date_range', '')}|{item.get('image_url', '')}"
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    item["rank"] = len(items) + 1
+                    item["_page"] = page_num + 1
+                    items.append(item)
+                    new_in_batch += 1
+
+            if not unlimited and len(items) >= top:
+                break
+
+            if new_in_batch == 0 and page_num > 0:
+                break
+
+            next_btn = page.locator(
+                '.ant-pagination-next:not(.ant-pagination-disabled)'
+            ).first
+            try:
+                is_visible = await next_btn.is_visible(timeout=3000)
+                if not is_visible:
+                    break
+                is_disabled = await next_btn.evaluate(
+                    "el => el.classList.contains('ant-pagination-disabled')"
+                )
+                if is_disabled:
+                    break
+                await next_btn.click(timeout=5000)
+                await page.wait_for_timeout(2000)
+                await page.wait_for_load_state("networkidle", timeout=10000)
+            except Exception:
+                break
+
+        return items if unlimited else items[:top]
+
+    # ------------------------------------------------------------------
+    # Video URL enrichment: click card → extract <video> src from modal
+    # ------------------------------------------------------------------
+
+    async def _goto_page(self, page: Page, target: int):
+        """Navigate to a specific pagination page number."""
+        for sel in [
+            f'.ant-pagination-item-{target}',
+            f'.ant-pagination-item[title="{target}"]',
+        ]:
+            try:
+                btn = page.locator(sel).first
+                if await btn.is_visible(timeout=2000):
+                    await btn.click(timeout=5000)
+                    await page.wait_for_timeout(2000)
+                    await page.wait_for_load_state("networkidle", timeout=10000)
+                    return True
+            except Exception:
+                continue
+
+        # Fallback: use the pagination jump input if available
+        try:
+            jump_input = page.locator('.ant-pagination-options-quick-jumper input').first
+            if await jump_input.is_visible(timeout=1000):
+                await jump_input.fill(str(target))
+                await jump_input.press("Enter")
+                await page.wait_for_timeout(2000)
+                await page.wait_for_load_state("networkidle", timeout=10000)
+                return True
+        except Exception:
+            pass
+
+        return False
+
+    async def _click_card_extract_video(self, page: Page, stem: str) -> dict | None:
+        """Find a card by image stem, click it, extract video info from modal."""
+        try:
+            img_el = page.locator(f'img[src*="{stem}"]').first
+            if not await img_el.is_visible(timeout=2000):
+                return None
+
+            await img_el.click(force=True, timeout=5000)
+            await page.wait_for_timeout(2000)
+
+            for _ in range(5):
+                has_video = await page.evaluate("() => !!document.querySelector('video')")
+                if has_video:
+                    break
+                await page.wait_for_timeout(1000)
+
+            video_info = await page.evaluate("""() => {
+                const v = document.querySelector('video');
+                if (!v) return null;
+                let src = v.src || '';
+                if (!src) {
+                    const source = v.querySelector('source');
+                    if (source) src = source.src || '';
+                }
+                return { src: src, poster: v.poster || '' };
+            }""")
+
+            # Close modal
+            closed = False
+            for sel in ['.ant-modal-close', '.ant-drawer-close',
+                        'button[aria-label="Close"]']:
+                try:
+                    btn = page.locator(sel).first
+                    if await btn.is_visible(timeout=500):
+                        await btn.click(timeout=2000)
+                        closed = True
+                        break
+                except Exception:
+                    continue
+            if not closed:
+                await page.keyboard.press("Escape")
+            await page.wait_for_timeout(1500)
+
+            if video_info and video_info.get("src"):
+                return video_info
+        except Exception:
+            try:
+                await page.keyboard.press("Escape")
+                await page.wait_for_timeout(1000)
+            except Exception:
+                pass
+        return None
+
+    async def _enrich_video_urls(self, page: Page, items: list[dict],
+                                  saved_filter: str | None = None) -> list[dict]:
+        """Extract real .mp4 video URLs by clicking each item's card.
+
+        Uses the _page field recorded during initial scrape to jump directly
+        to the right page instead of searching sequentially from page 1.
+        """
+        # Build lookup: stem → item index, grouped by page
+        page_items: dict[int, list[tuple[str, int]]] = {}
+        for i, item in enumerate(items):
+            img_url = item.get("image_url", "")
+            if not img_url:
+                continue
+            path = urlparse(img_url).path
+            fname = path.rsplit("/", 1)[-1] if "/" in path else path
+            stem = fname.rsplit(".", 1)[0] if "." in fname else fname
+            if stem:
+                pg = item.get("_page", 1)
+                page_items.setdefault(pg, []).append((stem, i))
+
+        if not page_items:
+            return items
+
+        # Re-navigate and re-apply filters
+        await page.goto(URLS["display_ads"], wait_until="networkidle")
+        await page.wait_for_timeout(3000)
+
+        await self._apply_filters(
+            page, media_type="视频", saved_filter=saved_filter,
+        )
+
+        enriched = 0
+        for target_page in sorted(page_items.keys()):
+            stems_on_page = page_items[target_page]
+
+            if target_page > 1:
+                ok = await self._goto_page(page, target_page)
+                if not ok:
+                    continue
+
+            await self._scroll_to_load_all(page)
+
+            for j, (stem, idx) in enumerate(stems_on_page):
+                if j > 0:
+                    await page.evaluate("() => window.scrollTo(0, 0)")
+                    await page.wait_for_timeout(500)
+                    await self._scroll_to_load_all(page)
+
+                video_info = await self._click_card_extract_video(page, stem)
+                if video_info:
+                    items[idx]["video_url"] = video_info["src"]
+                    if video_info.get("poster"):
+                        items[idx]["image_url"] = video_info["poster"]
+                    enriched += 1
+
         return items
 
+    # ------------------------------------------------------------------
+    # DOM card extraction for display-ads page
+    # ------------------------------------------------------------------
 
-# JS executed inside the browser to extract structured card data
-_JS_EXTRACT = """(topN) => {
-    const cards = document.querySelectorAll('div.rounded-lg.border');
-    const results = [];
-    const skip = new Set(['落地页','收藏','仅看该广告主','周人气值总量','创意AI标签','投放时间','天','~']);
-    let rank = 0;
+    async def _extract_display_ads(self, page: Page, top: int) -> list[dict]:
+        data = await page.evaluate("""(top) => {
+            const items = [];
+            const invalidTitles = new Set([
+                'Welcome to tengine!', 'Welcome to nginx!', '404 Not Found',
+                '', '应用信息',
+            ]);
 
-    for (const card of cards) {
-        if (rank >= topN) break;
-        const imgs = card.querySelectorAll('img');
-        if (imgs.length === 0) continue;
-        rank++;
+            const allCards = document.querySelectorAll('div[class*="shadow-common"]');
+            for (const card of allCards) {
+                if (items.length >= top) break;
 
-        // Separate creative image vs app icon
-        let creativeSrc = '', appIconSrc = '';
-        for (const img of imgs) {
-            const s = img.src || '';
-            if (!s || s.startsWith('data:')) continue;
-            if ((s.includes('sp2cdn') || s.includes('sp_opera')) && !creativeSrc) creativeSrc = s;
-            else if (s.includes('appcdn')) appIconSrc = s;
-            else if (img.classList.contains('object-cover') && !creativeSrc) creativeSrc = s;
-        }
+                const fullText = card.innerText || '';
+                if (!fullText.includes('人气值') || !fullText.match(/\\d{4}-\\d{2}-\\d{2}~/)) continue;
 
-        // Leaf text nodes
-        const leaves = [];
-        card.querySelectorAll('*').forEach(el => {
-            if (el.children.length === 0 && el.textContent) {
-                leaves.push({
-                    t: el.textContent.trim(),
-                    cls: el.className || '',
-                    pcls: (el.parentElement && el.parentElement.className) || '',
+                const creativeImg = card.querySelector('img[src*="sp2cdn-idea-global"]');
+                const iconImg = card.querySelector('img[src*="appcdn-global"]');
+
+                const zones = [...card.children].map(c => (c.innerText || '').trim());
+
+                const headerLines = (zones[0] || '').split('\\n').map(l => l.trim()).filter(Boolean);
+                let headerTitle = headerLines[0] || '';
+                let headerAdv = headerLines[1] || '';
+
+                const statsText = zones[2] || '';
+                const statsLines = statsText.split('\\n').map(l => l.trim()).filter(Boolean);
+                let statsAppName = statsLines[0] || '';
+
+                let title = '';
+                let advertiser = '';
+                if (!invalidTitles.has(headerTitle) && headerTitle.length > 1) {
+                    title = headerTitle;
+                    advertiser = headerAdv;
+                } else {
+                    title = statsAppName;
+                    advertiser = '';
+                }
+
+                if (!title || invalidTitles.has(title)) continue;
+
+                let popularity = '', days = '', lastSeen = '', impressions = '', heat = '';
+                let dateRange = '';
+                const allLines = fullText.split('\\n').map(l => l.trim()).filter(Boolean);
+                for (let i = 0; i < allLines.length; i++) {
+                    const l = allLines[i];
+                    if (/^\\d{4}-\\d{2}-\\d{2}~\\d{4}-\\d{2}-\\d{2}$/.test(l) && !dateRange) dateRange = l;
+                    if (l === '人气值' && i + 1 < allLines.length) popularity = allLines[i + 1];
+                    if (l === '投放天数' && i + 1 < allLines.length) days = allLines[i + 1];
+                    if (l === '最后看见' && i + 1 < allLines.length) lastSeen = allLines[i + 1];
+                    if (l.startsWith('展示估值')) impressions = l.replace(/展示估值[:：]?/, '').trim();
+                    if (l.startsWith('热度')) heat = l.replace(/热度[:：]?/, '').trim();
+                }
+
+                items.push({
+                    rank: items.length + 1,
+                    title: title,
+                    advertiser: advertiser,
+                    date_range: dateRange,
+                    popularity: popularity,
+                    days: days,
+                    last_seen: lastSeen,
+                    impressions: impressions,
+                    heat: heat,
+                    image_url: creativeImg ? creativeImg.src : '',
+                    icon_url: iconImg ? iconImg.src : '',
+                    scraped_at: new Date().toISOString(),
                 });
             }
-        });
+            return items;
+        }""", top)
+        return data
 
-        // Advertiser + publisher: first two non-tag, non-number, non-label texts
-        let advertiser = '', publisher = '';
-        let ni = 0;
-        for (const l of leaves) {
-            const t = l.t;
-            if (!t || skip.has(t) || t.length > 60) continue;
-            if (/^\\d/.test(t) || /^[#\\d万亿]+$/.test(t)) continue;
-            if (l.pcls.includes('ant-tag') || l.cls.includes('ant-tag')) continue;
-            if (l.cls.includes('font-medium') || l.cls.includes('text-[#999]')) continue;
-            if (ni === 0) { advertiser = t; ni++; }
-            else if (ni === 1) { publisher = t; break; }
-        }
 
-        // Popularity
-        let popularity = '';
-        for (const l of leaves) {
-            if (l.cls.includes('font-medium') && /[\\d万亿]+/.test(l.t)) {
-                popularity = l.t; break;
-            }
-        }
+    async def search_creatives(self, keyword: str, top: int = 20) -> list[dict]:
+        from urllib.parse import quote
+        page = self.page
+        url = f"{URLS['display_ads']}?keyword={quote(keyword)}"
+        await page.goto(url, wait_until="networkidle")
+        await page.wait_for_timeout(5000)
 
-        // All .ant-tag texts
-        const allTags = [];
-        card.querySelectorAll('.ant-tag').forEach(t => {
-            const txt = t.textContent.trim();
-            if (txt) allTags.push(txt);
-        });
+        no_data = await page.evaluate(
+            "() => (document.body.innerText || '').includes('暂无数据')"
+        )
+        if no_data:
+            self.results = []
+            return []
 
-        // Duration + dates
-        let durationDays = 0, dateStart = '', dateEnd = '';
-        for (let i = 0; i < leaves.length; i++) {
-            const t = leaves[i].t;
-            if (/^\\d+$/.test(t) && i+1 < leaves.length && leaves[i+1].t === '天') durationDays = parseInt(t);
-            if (/^\\d{4}-\\d{2}-\\d{2}$/.test(t)) {
-                if (!dateStart) dateStart = t;
-                else if (!dateEnd) dateEnd = t;
-            }
-        }
+        items = await self._extract_display_ads(page, top)
+        self.results = items
+        return items
 
-        results.push({rank, advertiser, publisher, popularity, creativeSrc, appIconSrc, allTags, durationDays, dateStart, dateEnd});
-    }
-    return results;
-}"""
+
+async def run_scrape(top: int = 0, period: str = "weekly", headless: bool = True,
+                     filter_tag: str | None = None, time_range: str | None = None,
+                     media_type: str | None = None,
+                     saved_filter: str | None = None,
+                     on_progress=None) -> list[dict]:
+    async with GuangdadaScraper(headless=headless) as scraper:
+        await scraper.login()
+        return await scraper.scrape_top_creatives(
+            top=top, period=period,
+            filter_tag=filter_tag, time_range=time_range,
+            media_type=media_type, saved_filter=saved_filter,
+            on_progress=on_progress,
+        )
+
+
+async def run_search(keyword: str, top: int = 20, headless: bool = True) -> list[dict]:
+    async with GuangdadaScraper(headless=headless) as scraper:
+        await scraper.login()
+        return await scraper.search_creatives(keyword=keyword, top=top)

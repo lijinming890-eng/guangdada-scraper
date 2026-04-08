@@ -1,19 +1,26 @@
+guangdada:
+  base_url: "https://www.guangdada.net"
+  login_url: "https://www.guangdada.net/user/login"
+  creative_url: "https://www.guangdada.net/cc/ad/creative"
+  default_top: 20
+  default_period: "weekly"  # daily / weekly / monthly
+
 scraper:
   headless: true
-  timeout_ms: 30000
-  cookie_reuse: true
-  user_agent: ""
+  timeout: 30000
+  retry_count: 3
+  retry_delay: 2
+  user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-output:
-  base_dir: "output/guangdada"
-  image_format: "original"
-  report_format: "md"
+download:
+  max_concurrent: 5
+  image_dir: "output/guangdada/images"
+  timeout: 30
 
 analysis:
-  basic_enabled: true
-  llm_enabled: false
-  llm_model: ""
+  output_dir: "output/guangdada"
+  report_format: "markdown"
 
 feishu:
+  webhook_url: ""
   enabled: false
-  mode: "notify"
