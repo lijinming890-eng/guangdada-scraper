@@ -102,7 +102,8 @@ class GuangdadaScraper:
                                     time_range: str | None = None,
                                     media_type: str | None = None,
                                     saved_filter: str | None = None,
-                                    on_progress=None) -> list[dict]:
+                                    on_progress=None,
+                                    max_pages: int = 0) -> list[dict]:
         page = self.page
 
         if on_progress:
@@ -122,7 +123,7 @@ class GuangdadaScraper:
 
         if on_progress:
             on_progress("正在抓取素材数据...")
-        items = await self._extract_with_pagination(page, 0, on_progress=on_progress)
+        items = await self._extract_with_pagination(page, 0, on_progress=on_progress, max_pages_override=max_pages)
 
         items = self._sort_by_impressions(items)
 
@@ -257,21 +258,27 @@ class GuangdadaScraper:
         await page.wait_for_timeout(500)
 
     async def _extract_with_pagination(self, page: Page, top: int,
-                                        on_progress=None) -> list[dict]:
+                                        on_progress=None,
+                                        max_pages_override: int = 0) -> list[dict]:
         """Extract cards across multiple pages.
 
         Args:
-            top: Max items to collect. 0 means scrape up to ~15 pages for sorting.
+            top: Max items to collect. 0 means scrape all pages.
+            max_pages_override: Hard limit on pages. 0 = use default logic.
         """
         items: list[dict] = []
         seen_keys: set[str] = set()
         unlimited = top == 0
-        max_pages = 15 if unlimited else (top // 3) + 5
+        if max_pages_override > 0:
+            max_pages = max_pages_override
+        else:
+            max_pages = 9999 if unlimited else (top // 3) + 5
         extract_limit = 500 if unlimited else top * 2
 
-        for page_num in range(max_pages):
+        page_num = 0
+        while page_num < max_pages:
             if on_progress:
-                on_progress(f"  第 {page_num + 1}/{max_pages} 页, 已收集 {len(items)} 条...")
+                on_progress(f"  第 {page_num + 1} 页, 已收集 {len(items)} 条...")
             await self._scroll_to_load_all(page)
 
             batch = await self._extract_display_ads(page, extract_limit)
@@ -309,6 +316,8 @@ class GuangdadaScraper:
             except Exception:
                 break
 
+            page_num += 1
+
         return items if unlimited else items[:top]
 
     # ------------------------------------------------------------------
@@ -345,55 +354,94 @@ class GuangdadaScraper:
 
         return False
 
-    async def _click_card_extract_video(self, page: Page, stem: str) -> dict | None:
-        """Find a card by image stem, click it, extract video info from modal."""
-        try:
-            img_el = page.locator(f'img[src*="{stem}"]').first
-            if not await img_el.is_visible(timeout=2000):
-                return None
+    async def _close_modal(self, page: Page):
+        """Close any open modal/drawer."""
+        for sel in ['.ant-modal-close', '.ant-drawer-close',
+                    'button[aria-label="Close"]']:
+            try:
+                btn = page.locator(sel).first
+                if await btn.is_visible(timeout=500):
+                    await btn.click(timeout=2000)
+                    await page.wait_for_timeout(1500)
+                    return
+            except Exception:
+                continue
+        await page.keyboard.press("Escape")
+        await page.wait_for_timeout(1500)
 
-            await img_el.click(force=True, timeout=5000)
+    async def _extract_video_from_modal(self, page: Page) -> dict | None:
+        """Wait for video element in modal and extract its URL."""
+        for _ in range(5):
+            has_video = await page.evaluate("() => !!document.querySelector('video')")
+            if has_video:
+                break
+            await page.wait_for_timeout(1000)
+
+        video_info = await page.evaluate("""() => {
+            const v = document.querySelector('video');
+            if (!v) return null;
+            let src = v.src || '';
+            if (!src) {
+                const source = v.querySelector('source');
+                if (source) src = source.src || '';
+            }
+            return { src: src, poster: v.poster || '' };
+        }""")
+
+        if video_info and video_info.get("src"):
+            return video_info
+        return None
+
+    async def _click_card_extract_video(self, page: Page, stem: str,
+                                         title: str = "") -> dict | None:
+        """Find a card by image stem or title, click it, extract video URL."""
+        clickable = None
+
+        # Strategy 1: find by image stem in DOM (even if not visible)
+        if stem:
+            try:
+                img_el = page.locator(f'img[src*="{stem}"]').first
+                count = await page.locator(f'img[src*="{stem}"]').count()
+                if count > 0:
+                    await img_el.scroll_into_view_if_needed(timeout=3000)
+                    await page.wait_for_timeout(500)
+                    clickable = img_el
+            except Exception:
+                pass
+
+        # Strategy 2: find card by title text
+        if not clickable and title:
+            try:
+                escaped = title.replace("'", "\\'")
+                card_loc = page.locator(f'div[class*="shadow-common"]:has-text("{escaped}")').first
+                count = await page.locator(f'div[class*="shadow-common"]:has-text("{escaped}")').count()
+                if count > 0:
+                    img_in_card = card_loc.locator('img[src*="sp2cdn-idea-global"]').first
+                    img_count = await card_loc.locator('img[src*="sp2cdn-idea-global"]').count()
+                    if img_count > 0:
+                        await img_in_card.scroll_into_view_if_needed(timeout=3000)
+                        await page.wait_for_timeout(500)
+                        clickable = img_in_card
+                    else:
+                        await card_loc.scroll_into_view_if_needed(timeout=3000)
+                        await page.wait_for_timeout(500)
+                        clickable = card_loc
+            except Exception:
+                pass
+
+        if not clickable:
+            return None
+
+        try:
+            await clickable.click(force=True, timeout=5000)
             await page.wait_for_timeout(2000)
 
-            for _ in range(5):
-                has_video = await page.evaluate("() => !!document.querySelector('video')")
-                if has_video:
-                    break
-                await page.wait_for_timeout(1000)
-
-            video_info = await page.evaluate("""() => {
-                const v = document.querySelector('video');
-                if (!v) return null;
-                let src = v.src || '';
-                if (!src) {
-                    const source = v.querySelector('source');
-                    if (source) src = source.src || '';
-                }
-                return { src: src, poster: v.poster || '' };
-            }""")
-
-            # Close modal
-            closed = False
-            for sel in ['.ant-modal-close', '.ant-drawer-close',
-                        'button[aria-label="Close"]']:
-                try:
-                    btn = page.locator(sel).first
-                    if await btn.is_visible(timeout=500):
-                        await btn.click(timeout=2000)
-                        closed = True
-                        break
-                except Exception:
-                    continue
-            if not closed:
-                await page.keyboard.press("Escape")
-            await page.wait_for_timeout(1500)
-
-            if video_info and video_info.get("src"):
-                return video_info
+            video_info = await self._extract_video_from_modal(page)
+            await self._close_modal(page)
+            return video_info
         except Exception:
             try:
-                await page.keyboard.press("Escape")
-                await page.wait_for_timeout(1000)
+                await self._close_modal(page)
             except Exception:
                 pass
         return None
@@ -405,18 +453,19 @@ class GuangdadaScraper:
         Uses the _page field recorded during initial scrape to jump directly
         to the right page instead of searching sequentially from page 1.
         """
-        # Build lookup: stem → item index, grouped by page
-        page_items: dict[int, list[tuple[str, int]]] = {}
+        # Build lookup: (stem, title) → item index, grouped by page
+        page_items: dict[int, list[tuple[str, str, int]]] = {}
         for i, item in enumerate(items):
             img_url = item.get("image_url", "")
-            if not img_url:
-                continue
-            path = urlparse(img_url).path
-            fname = path.rsplit("/", 1)[-1] if "/" in path else path
-            stem = fname.rsplit(".", 1)[0] if "." in fname else fname
-            if stem:
+            title = item.get("title", "")
+            stem = ""
+            if img_url:
+                path = urlparse(img_url).path
+                fname = path.rsplit("/", 1)[-1] if "/" in path else path
+                stem = fname.rsplit(".", 1)[0] if "." in fname else fname
+            if stem or title:
                 pg = item.get("_page", 1)
-                page_items.setdefault(pg, []).append((stem, i))
+                page_items.setdefault(pg, []).append((stem, title, i))
 
         if not page_items:
             return items
@@ -430,28 +479,35 @@ class GuangdadaScraper:
         )
 
         enriched = 0
+        total_stems = sum(len(v) for v in page_items.values())
+        print(f"  [enrich] {total_stems} items across {len(page_items)} pages to enrich")
+
         for target_page in sorted(page_items.keys()):
             stems_on_page = page_items[target_page]
 
             if target_page > 1:
                 ok = await self._goto_page(page, target_page)
                 if not ok:
+                    print(f"  [enrich] SKIP page {target_page}: goto failed")
                     continue
 
             await self._scroll_to_load_all(page)
 
-            for j, (stem, idx) in enumerate(stems_on_page):
+            for j, (stem, title, idx) in enumerate(stems_on_page):
                 if j > 0:
                     await page.evaluate("() => window.scrollTo(0, 0)")
                     await page.wait_for_timeout(500)
                     await self._scroll_to_load_all(page)
 
-                video_info = await self._click_card_extract_video(page, stem)
+                video_info = await self._click_card_extract_video(page, stem, title=title)
                 if video_info:
                     items[idx]["video_url"] = video_info["src"]
                     if video_info.get("poster"):
                         items[idx]["image_url"] = video_info["poster"]
                     enriched += 1
+                    print(f"  [enrich] OK #{items[idx].get('rank','')} on page {target_page}")
+                else:
+                    print(f"  [enrich] FAIL #{items[idx].get('rank','')} title={title[:20]} page={target_page}")
 
         return items
 
@@ -555,7 +611,8 @@ async def run_scrape(top: int = 0, period: str = "weekly", headless: bool = True
                      filter_tag: str | None = None, time_range: str | None = None,
                      media_type: str | None = None,
                      saved_filter: str | None = None,
-                     on_progress=None) -> list[dict]:
+                     on_progress=None,
+                     max_pages: int = 0) -> list[dict]:
     async with GuangdadaScraper(headless=headless) as scraper:
         await scraper.login()
         return await scraper.scrape_top_creatives(
@@ -563,6 +620,7 @@ async def run_scrape(top: int = 0, period: str = "weekly", headless: bool = True
             filter_tag=filter_tag, time_range=time_range,
             media_type=media_type, saved_filter=saved_filter,
             on_progress=on_progress,
+            max_pages=max_pages,
         )
 
 

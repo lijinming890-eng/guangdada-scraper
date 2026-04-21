@@ -22,6 +22,7 @@ from .scraper import run_scrape, run_search
 from .image_downloader import download_all
 from .analyzer import analyze_items, generate_report
 from .feishu_publisher import publish_to_feishu
+from .library_pusher import push_items_sync, push_directory_sync
 
 console = Console(force_terminal=True)
 
@@ -61,10 +62,15 @@ def logout():
 @click.option("--output-dir", "-o", default=None, help="输出目录")
 @click.option("--export-feishu", is_flag=True, help="爬取完自动输出到飞书文档")
 @click.option("--analyze", is_flag=True, help="启用 AI 视觉分析（对每张素材图片做创意分析）")
+@click.option("--chat-output", is_flag=True, help="输出适合聊天显示的JSON格式（OpenClaw直接反馈）")
+@click.option("--push-library", is_flag=True, help="爬取完自动推送到一键出图图库")
+@click.option("--library-category", default="reference", help="推送到图库的分类 (reference/character/background)")
+@click.option("--library-api", default="http://localhost:3000", help="一键出图服务地址")
 def scrape(top: int, scrape_all: bool, period: str, filter_tag: str, time_range: str,
            media_type: str, saved_filter: str,
            no_download: bool, no_headless: bool, output_dir: str, export_feishu: bool,
-           analyze: bool):
+           analyze: bool, chat_output: bool, push_library: bool, library_category: str,
+           library_api: str):
     """抓取广大大买量素材"""
     creds = credential_store.load_credentials()
     if not creds:
@@ -132,7 +138,12 @@ def scrape(top: int, scrape_all: bool, period: str, filter_tag: str, time_range:
     report = generate_report(items, output_dir)
     console.print(f"\n[green]✓ 报告已生成: {report}[/green]")
 
-    if export_feishu:
+    if push_library:
+        _push_to_library(items, library_category, library_api)
+
+    if chat_output:
+        _write_chat_output(items, report, output_dir)
+    elif export_feishu:
         _export_to_feishu(report)
 
 
@@ -141,7 +152,11 @@ def scrape(top: int, scrape_all: bool, period: str, filter_tag: str, time_range:
 @click.option("--top", "-n", default=20, show_default=True, help="最多返回条数")
 @click.option("--no-download", is_flag=True, help="跳过图片下载")
 @click.option("--output-dir", "-o", default=None, help="输出目录")
-def search(keyword: str, top: int, no_download: bool, output_dir: str):
+@click.option("--push-library", is_flag=True, help="搜索完自动推送到一键出图图库")
+@click.option("--library-category", default="reference", help="推送到图库的分类")
+@click.option("--library-api", default="http://localhost:3000", help="一键出图服务地址")
+def search(keyword: str, top: int, no_download: bool, output_dir: str,
+           push_library: bool, library_category: str, library_api: str):
     """按关键词搜索广大大广告素材 (APP名/广告主/文案)"""
     creds = credential_store.load_credentials()
     if not creds:
@@ -170,6 +185,9 @@ def search(keyword: str, top: int, no_download: bool, output_dir: str):
     items = analyze_items(items)
     report = generate_report(items, output_dir)
     console.print(f"\n[green]✓ 报告已生成: {report}[/green]")
+
+    if push_library:
+        _push_to_library(items, library_category, library_api)
 
 
 @cli.command()
@@ -262,6 +280,58 @@ def doctor():
         console.print("    → 复制 config.yaml.template 为 config.yaml 进行自定义配置")
 
 
+DEFAULT_API = "http://localhost:3000"
+
+
+def _push_to_library(items: list[dict], category: str = "reference", api_base: str = DEFAULT_API):
+    """Push scraped items to the one-click image library."""
+    console.print(f"\n[bold blue]正在推送 {len(items)} 张素材到一键出图图库...[/bold blue]")
+
+    def _progress(msg):
+        console.print(f"  [dim]{msg}[/dim]")
+
+    try:
+        result = push_items_sync(items, category=category, api_base=api_base, on_progress=_progress)
+        skipped = result.get("skipped", 0)
+        parts = [f"[green]✓ 推送完成: {result['success']} 张新增[/green]"]
+        if skipped:
+            parts.append(f"[dim], {skipped} 张已存在(跳过)[/dim]")
+        if result["failed"]:
+            parts.append(f"[yellow], {result['failed']} 张失败[/yellow]")
+        console.print("  " + "".join(parts))
+    except Exception as e:
+        console.print(f"  [red]✗ 推送失败: {e}[/red]")
+        console.print(f"  [dim]请确保一键出图服务正在运行 ({api_base})[/dim]")
+
+
+@cli.command(name="push-library")
+@click.option("--dir", "-d", "input_dir", required=True, help="图片目录路径")
+@click.option("--category", "-c", default="reference",
+              type=click.Choice(["reference", "character", "background", "copytext"]),
+              help="图库分类")
+@click.option("--api", default=DEFAULT_API, help="一键出图服务地址")
+def push_library(input_dir: str, category: str, api: str):
+    """将本地图片目录推送到一键出图图库"""
+    input_path = Path(input_dir)
+    if not input_path.exists():
+        console.print(f"[red]✗ 目录不存在: {input_dir}[/red]")
+        sys.exit(1)
+
+    console.print(Panel(f"[bold]推送图片到图库: {input_dir} → {category}[/bold]", style="blue"))
+
+    def _progress(msg):
+        console.print(f"  [dim]{msg}[/dim]")
+
+    try:
+        result = push_directory_sync(input_dir, category=category, api_base=api, on_progress=_progress)
+        console.print(f"\n[green]✓ 推送完成: {result['success']}/{result['total']} 张成功[/green]")
+        if result["failed"]:
+            console.print(f"[yellow]  {result['failed']} 张失败[/yellow]")
+    except Exception as e:
+        console.print(f"[red]✗ 推送失败: {e}[/red]")
+        sys.exit(1)
+
+
 def _export_to_feishu(report_path: str):
     """Import the Markdown report into a Feishu document with embedded images."""
     from .feishu_publisher import import_markdown_to_feishu
@@ -300,6 +370,47 @@ def _export_to_feishu(report_path: str):
         console.print(f"  [red]✗ 飞书导入失败: {e}[/red]")
 
 
+def _write_chat_output(items: list[dict], report_path: str, output_dir: str | None):
+    """Write a JSON file optimized for OpenClaw chat display."""
+    import json
+    from datetime import datetime
+
+    base = Path(output_dir) if output_dir else Path("output/guangdada")
+    base.mkdir(parents=True, exist_ok=True)
+    out_path = base / "chat_output.json"
+
+    chat_items = []
+    for item in items:
+        local_img = item.get("local_image", "")
+        if local_img:
+            local_img = str(Path(local_img).resolve())
+        entry = {
+            "rank": item.get("rank", 0),
+            "title": item.get("title", ""),
+            "advertiser": item.get("advertiser", ""),
+            "impressions": item.get("impressions", ""),
+            "popularity": item.get("popularity", ""),
+            "days": item.get("days", ""),
+            "date_range": item.get("date_range", ""),
+            "image_url": item.get("image_url", ""),
+            "local_image": local_img,
+            "video_url": item.get("video_url", ""),
+            "ai_analysis": item.get("ai_analysis"),
+        }
+        chat_items.append(entry)
+
+    output = {
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "total": len(chat_items),
+        "report_path": str(report_path),
+        "items": chat_items,
+    }
+
+    out_path.write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
+    console.print(f"\n[green]✓ 聊天输出已生成: {out_path}[/green]")
+    console.print("[dim]OpenClaw 可读取此文件直接在聊天中显示结果[/dim]")
+
+
 def _show_table(items: list[dict]):
     table = Table(title="抓取结果", show_lines=True)
     table.add_column("排名", style="bold cyan", width=6)
@@ -329,7 +440,9 @@ def _show_table(items: list[dict]):
 @click.option("--top", "-n", default=20, show_default=True, help="抓取数量")
 @click.option("--period", "-p", default="weekly", type=click.Choice(["daily", "weekly", "monthly"]))
 @click.option("--publish-feishu", is_flag=True, help="自动发布到飞书")
-def run(top: int, period: str, publish_feishu: bool):
+@click.option("--push-library", is_flag=True, help="自动推送到一键出图图库")
+@click.option("--library-category", default="reference", help="推送到图库的分类")
+def run(top: int, period: str, publish_feishu: bool, push_library: bool, library_category: str):
     """一键运行: 抓取 → 下载 → 分析 → (可选)发布"""
     creds = credential_store.load_credentials()
     if not creds:
@@ -351,6 +464,9 @@ def run(top: int, period: str, publish_feishu: bool):
     console.print(f"[green]✓ Step 3/3: 报告 → {report}[/green]")
 
     _show_table(items)
+
+    if push_library:
+        _push_to_library(items, library_category)
 
     if publish_feishu:
         try:

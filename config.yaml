@@ -1,0 +1,30 @@
+guangdada:
+  base_url: "https://www.guangdada.net"
+  login_url: "https://www.guangdada.net/user/login"
+  # 榜单页面URL（日/周/月热门榜）
+  # 日: /modules/creative/charts/hot-charts
+  # 周: /modules/creative/charts/hot-charts?period=week (或使用 surge-charts)
+  # 月: /modules/creative/charts/hot-charts?period=month
+  creative_url: "https://www.guangdada.net/modules/creative/charts/hot-charts"
+  default_top: 20
+  default_period: "weekly"  # daily / weekly / monthly
+
+scraper:
+  headless: true
+  timeout: 30000
+  retry_count: 3
+  retry_delay: 2
+  user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+download:
+  max_concurrent: 5
+  image_dir: "output/guangdada/images"
+  timeout: 30
+
+analysis:
+  output_dir: "output/guangdada"
+  report_format: "markdown"
+
+feishu:
+  webhook_url: ""
+  enabled: false

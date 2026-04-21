@@ -1,42 +1,39 @@
-# Credentials & browser state (stored in ~/.openclaw/)
-*.key
-*.credentials.enc
-guangdada_state/
-
-# Output (generated data)
+# Output
 output/
+*.png
+*.jpg
+*.jpeg
+*.mp4
 
 # Python
 __pycache__/
 *.pyc
-.pytest_cache/
+*.pyo
 *.egg-info/
+dist/
+build/
+.eggs/
 
-# Config (may contain sensitive overrides)
-config.yaml
+# Credentials (never commit!)
+*.enc
+*.key
+.env
 
-# Debug screenshots
-debug_*.png
-chart_*.png
-homepage.png
-test_display-ads.png
+# IDE
+.vscode/
+.idea/
+*.swp
 
-# Temporary test/debug scripts (not part of core)
+# OS
+Thumbs.db
+.DS_Store
+
+# Debug/temp scripts
+debug_*.py
+test_*.py
 analyze_html.py
-extract_chart.py
-extract_list.py
+extract_*.py
 find_page.py
 get_full_items.py
 inspect_page.py
 save_creds.py
-test_browser.py
-test_chart_page.py
-test_full.py
-test_ranking.py
-test_ai.py
-test_video_upload.py
-_query_memory.py
-
-# OS
-.DS_Store
-Thumbs.db
